@@ -104,13 +104,22 @@ const Dashboard = () => {
             </h1>
             <p className="text-slate-600 text-lg">University Uniform Inventory Management</p>
           </div>
-          <Button 
-            variant="outline" 
-            onClick={() => navigate('/settings')}
-            className="bg-white shadow-lg hover:shadow-xl"
-          >
-            ⚙️ Settings
-          </Button>
+          <div className="flex gap-2">
+            <Button 
+              variant="outline" 
+              onClick={() => navigate('/students')}
+              className="bg-white shadow-lg hover:shadow-xl"
+            >
+              👥 Students
+            </Button>
+            <Button 
+              variant="outline" 
+              onClick={() => navigate('/settings')}
+              className="bg-white shadow-lg hover:shadow-xl"
+            >
+              ⚙️ Settings
+            </Button>
+          </div>
         </div>
 
         {/* Stats Cards */}
@@ -218,6 +227,32 @@ const Dashboard = () => {
             </CardHeader>
           </Card>
         </div>
+
+        {/* Database Setup Warning */}
+        {stats.total_items === 0 && (
+          <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-6 mb-8">
+            <h3 className="text-lg font-semibold text-yellow-800 mb-2 flex items-center gap-2">
+              ⚠️ Database Setup Required
+            </h3>
+            <p className="text-yellow-700 mb-4">
+              No data found in your database. You need to run the SQL setup script in Supabase first.
+            </p>
+            <div className="space-y-2 text-sm">
+              <p className="text-yellow-600">
+                <strong>Step 1:</strong> Go to your Supabase dashboard → SQL Editor
+              </p>
+              <p className="text-yellow-600">
+                <strong>Step 2:</strong> Copy and paste the contents of <code className="bg-yellow-100 px-2 py-1 rounded">simple_setup.sql</code>
+              </p>
+              <p className="text-yellow-600">
+                <strong>Step 3:</strong> Click "Run" to create all tables and sample data
+              </p>
+              <p className="text-yellow-600">
+                <strong>Step 4:</strong> Refresh this page
+              </p>
+            </div>
+          </div>
+        )}
       </div>
     </div>
   );
@@ -313,6 +348,8 @@ const ReceiveStock = () => {
 
       // 2. Update stock balance for each item
       for (const item of validItems) {
+        console.log('Processing stock update for:', item);
+        
         // Get current stock
         const { data: currentStock, error: stockError } = await supabase
           .from('stock_balance')
@@ -324,15 +361,19 @@ const ReceiveStock = () => {
         const currentQuantity = currentStock?.quantity || 0;
         const newQuantity = currentQuantity + item.quantity;
 
-        // Update stock balance
-        const { error: updateError } = await supabase
+        console.log(`Stock update: ${item.item_name} ${item.size || 'no size'} - ${currentQuantity} + ${item.quantity} = ${newQuantity}`);
+
+        // First try to update existing record
+        const { data: updateData, error: updateError } = await supabase
           .from('stock_balance')
           .update({ quantity: newQuantity })
           .eq('item_id', item.item_id)
-          .eq('size', item.size || null);
-        
-        if (updateError) {
-          // If update fails, try to insert
+          .eq('size', item.size || null)
+          .select();
+
+        // If no rows were updated, insert new record
+        if (updateError || !updateData || updateData.length === 0) {
+          console.log('No existing record found, inserting new record');
           const { error: insertError } = await supabase
             .from('stock_balance')
             .insert({
@@ -341,7 +382,10 @@ const ReceiveStock = () => {
               quantity: newQuantity
             });
           
-          if (insertError) throw insertError;
+          if (insertError) {
+            console.error('Insert error:', insertError);
+            throw new Error(`Failed to add stock for ${item.item_name}: ${insertError.message}`);
+          }
         }
       }
       
@@ -525,10 +569,31 @@ const IssueUniform = () => {
 
   useEffect(() => {
     if (supabase) {
-      fetchUniformItems();
-      fetchItemLimits();
+      initializeData();
     }
   }, []);
+
+  const initializeData = async () => {
+    try {
+      // Check if we have any data
+      const { data: itemsData, error: itemsError } = await supabase
+        .from('uniform_items')
+        .select('id')
+        .limit(1);
+
+      if (itemsError || !itemsData || itemsData.length === 0) {
+        toast.error("No data found. Please run the SQL setup script in Supabase first!");
+        return;
+      }
+
+      // If we have data, fetch everything
+      await fetchUniformItems();
+      await fetchItemLimits();
+    } catch (error) {
+      console.error("Error initializing data:", error);
+      toast.error("Failed to initialize data. Please check your Supabase connection.");
+    }
+  };
 
   useEffect(() => {
     if (student && supabase) {
@@ -544,8 +609,14 @@ const IssueUniform = () => {
         .select('*')
         .order('name');
       
-      if (error) throw error;
+      if (error) {
+        console.error("Error fetching uniform items:", error);
+        toast.error("Failed to load uniform items: " + error.message);
+        return;
+      }
+      
       setUniformItems(data || []);
+      console.log('Loaded uniform items:', data);
     } catch (error) {
       console.error("Error fetching uniform items:", error);
       toast.error("Failed to load uniform items");
@@ -601,44 +672,36 @@ const IssueUniform = () => {
 
   const fetchStockLimits = async () => {
     try {
-      // First try to get from stock_balance table
+      console.log('Fetching stock limits...');
       const { data: stockData, error: stockError } = await supabase
         .from('stock_balance')
-        .select('*');
+        .select(`
+          *,
+          uniform_items!inner(name)
+        `);
       
       if (stockError) {
-        console.warn("stock_balance table not found, using fallback");
-        // Fallback: use uniform_items table if stock_balance doesn't exist
-        const { data: itemsData, error: itemsError } = await supabase
-          .from('uniform_items')
-          .select('*');
-        
-        if (itemsError) throw itemsError;
-        
-        const stockMap = {};
-        itemsData?.forEach(item => {
-          if (item.has_size) {
-            SIZES.forEach(size => {
-              const key = item.id + size;
-              stockMap[key] = 0; // Default to 0 if no stock_balance data
-            });
-          } else {
-            const key = item.id;
-            stockMap[key] = 0; // Default to 0 if no stock_balance data
-          }
-        });
-        setStockLimits(stockMap);
+        console.error("Error fetching stock balance:", stockError);
+        toast.error("Failed to fetch stock data: " + stockError.message);
         return;
       }
       
       const stockMap = {};
-      stockData?.forEach(stock => {
-        const key = stock.item_id + (stock.size || '');
-        stockMap[key] = stock.quantity;
-      });
+      if (stockData && stockData.length > 0) {
+        stockData.forEach(stock => {
+          const key = stock.item_id + (stock.size || '');
+          stockMap[key] = stock.quantity;
+          console.log(`Stock: ${stock.uniform_items.name} ${stock.size || 'no size'} = ${stock.quantity}`);
+        });
+      } else {
+        console.log('No stock data found');
+      }
+      
+      console.log('Complete stock map:', stockMap);
       setStockLimits(stockMap);
     } catch (error) {
       console.error("Error fetching stock limits:", error);
+      toast.error("Failed to fetch stock data");
     }
   };
 
@@ -833,67 +896,100 @@ const IssueUniform = () => {
     }
 
     try {
-      // Start a transaction-like process
-      // 1. Create the issue receipt
-      const { data: receiptData, error: receiptError } = await supabase
+      // Create the issue receipt
+      const receiptData = {
+        student_id: student.id,
+        student_name: student.name,
+        registration_number: student.registration_number,
+        roll_number: student.roll_number,
+        items: selectedItems,
+        issued_date: new Date().toISOString().split('T')[0],
+        issued_by: issuedBy,
+        bill_number: billNumber
+      };
+
+      console.log('Creating receipt:', receiptData);
+      
+      const { data: receipt, error: receiptError } = await supabase
         .from('issue_receipts')
-        .insert({
-          student_id: student.id,
-          student_name: student.name,
-          registration_number: student.registration_number,
-          roll_number: student.roll_number,
-          items: selectedItems,
-          issued_date: new Date().toISOString().split('T')[0],
-          issued_by: issuedBy,
-          bill_number: billNumber
-        })
+        .insert([receiptData])
         .select()
         .single();
       
-      if (receiptError) throw receiptError;
+      if (receiptError) {
+        console.error('Receipt error:', receiptError);
+        throw new Error(`Failed to create receipt: ${receiptError.message}`);
+      }
 
-      // 2. Update stock for each item
+      console.log('Receipt created successfully:', receipt);
+
+      // Update stock for each item
       for (const item of selectedItems) {
-        const key = item.item_id + (item.size || '');
-        const currentStock = stockLimits[key] || 0;
-        const newStock = currentStock - item.quantity;
-
-        // Update stock balance using the correct approach
-        const { error: stockError } = await supabase
-          .from('stock_balance')
-          .update({ quantity: newStock })
-          .eq('item_id', item.item_id)
-          .eq('size', item.size || null);
+        console.log('Processing item:', item);
         
-        if (stockError) {
-          // If update fails, try to insert
+        // Get current stock
+        const { data: currentStockData, error: stockFetchError } = await supabase
+          .from('stock_balance')
+          .select('quantity')
+          .eq('item_id', item.item_id)
+          .eq('size', item.size || null)
+          .single();
+
+        if (stockFetchError && stockFetchError.code !== 'PGRST116') {
+          console.error('Stock fetch error:', stockFetchError);
+          throw new Error(`Failed to fetch stock for ${item.name}: ${stockFetchError.message}`);
+        }
+
+        const currentQuantity = currentStockData?.quantity || 0;
+        const newQuantity = Math.max(0, currentQuantity - item.quantity);
+
+        console.log(`Stock update: ${item.name} ${item.size || 'no size'} - ${currentQuantity} -> ${newQuantity}`);
+
+        // First try to update existing record
+        const { data: updateData, error: updateError } = await supabase
+          .from('stock_balance')
+          .update({ quantity: newQuantity })
+          .eq('item_id', item.item_id)
+          .eq('size', item.size || null)
+          .select();
+
+        // If no rows were updated, insert new record
+        if (updateError || !updateData || updateData.length === 0) {
+          console.log('No existing record found, inserting new record');
           const { error: insertError } = await supabase
             .from('stock_balance')
             .insert({
               item_id: item.item_id,
               size: item.size || null,
-              quantity: newStock
+              quantity: newQuantity
             });
           
-          if (insertError) throw insertError;
+          if (insertError) {
+            console.error('Insert error:', insertError);
+            throw new Error(`Failed to update stock for ${item.name}: ${insertError.message}`);
+          }
         }
       }
       
-      toast.success("Uniform issued successfully!");
+      toast.success("✅ Uniform issued successfully! Receipt: " + billNumber);
       
       // Clear form
       setSelectedItems([]);
       setIssuedBy("");
       setBillNumber("");
+      setStudent(null);
+      setSearchQuery("");
       
-      // Refresh data
-      fetchStudentAlreadyTaken();
-      fetchStockLimits();
+      // Refresh data immediately
+      await Promise.all([
+        fetchStudentAlreadyTaken(),
+        fetchStockLimits()
+      ]);
       
       navigate('/');
     } catch (error) {
       console.error("Error issuing uniform:", error);
-      toast.error("Failed to issue uniform: " + error.message);
+      toast.error("❌ Failed to issue uniform: " + error.message);
     }
   };
 
@@ -1135,6 +1231,7 @@ const IssueUniform = () => {
                   </div>
                 </div>
 
+
                 <div className="mb-6">
                   <Label htmlFor="issued_by">Issued By *</Label>
                   <Input
@@ -1143,6 +1240,24 @@ const IssueUniform = () => {
                     value={issuedBy}
                     onChange={(e) => setIssuedBy(e.target.value)}
                   />
+                </div>
+
+                <div className="mb-6">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => {
+                      console.log('=== DEBUG STOCK DATA ===');
+                      console.log('stockLimits:', stockLimits);
+                      console.log('uniformItems:', uniformItems);
+                      console.log('itemLimits:', itemLimits);
+                      console.log('studentAlreadyTaken:', studentAlreadyTaken);
+                      console.log('========================');
+                    }}
+                    className="w-full"
+                  >
+                    🔍 Debug Stock Data (Check Console)
+                  </Button>
                 </div>
 
                 <Button 
@@ -1482,6 +1597,9 @@ const History = () => {
                           <div>
                             <p className="font-bold text-lg">{issue.student_name}</p>
                             <p className="text-sm text-slate-600">Reg: {issue.registration_number} | Roll: {issue.roll_number}</p>
+                            {issue.bill_number && (
+                              <p className="text-xs text-blue-600 font-medium">Bill: {issue.bill_number}</p>
+                            )}
                           </div>
                           <div className="text-right">
                             <p className="text-sm text-slate-600">{new Date(issue.issued_date).toLocaleDateString()}</p>
@@ -1491,7 +1609,7 @@ const History = () => {
                         <div className="text-sm">
                           {issue.items.map((item, i) => (
                             <p key={i} className="text-slate-600">
-                              {item.item_name} ({item.size}) × {item.quantity}
+                              {item.name || item.item_name} {item.size ? `(${item.size})` : ''} × {item.quantity}
                             </p>
                           ))}
                         </div>
@@ -1506,6 +1624,228 @@ const History = () => {
             </Tabs>
           </CardContent>
         </Card>
+      </div>
+    </div>
+  );
+};
+
+// Student Management Component
+const StudentManagement = () => {
+  const navigate = useNavigate();
+  const [students, setStudents] = useState([]);
+  const [showAddStudentDialog, setShowAddStudentDialog] = useState(false);
+  const [newStudent, setNewStudent] = useState({
+    registration_number: "",
+    roll_number: "",
+    name: "",
+    class_year: "",
+    course: "",
+    phone: ""
+  });
+
+  useEffect(() => {
+    if (supabase) {
+      fetchStudents();
+    }
+  }, []);
+
+  const fetchStudents = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('students')
+        .select('*')
+        .order('name');
+      
+      if (error) throw error;
+      setStudents(data || []);
+    } catch (error) {
+      console.error("Error fetching students:", error);
+      toast.error("Failed to load students");
+    }
+  };
+
+  const handleAddStudent = async () => {
+    if (!newStudent.registration_number || !newStudent.roll_number || !newStudent.name || !newStudent.class_year) {
+      toast.error("Please fill all required fields");
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('students')
+        .insert([newStudent]);
+      
+      if (error) throw error;
+      
+      toast.success("Student added successfully!");
+      setShowAddStudentDialog(false);
+      setNewStudent({
+        registration_number: "",
+        roll_number: "",
+        name: "",
+        class_year: "",
+        course: "",
+        phone: ""
+      });
+      fetchStudents();
+    } catch (error) {
+      console.error("Error adding student:", error);
+      toast.error("Failed to add student: " + (error.message || "Unknown error"));
+    }
+  };
+
+  const handleDeleteStudent = async (studentId) => {
+    if (!window.confirm("Are you sure you want to delete this student?")) {
+      return;
+    }
+
+    try {
+      const { error } = await supabase
+        .from('students')
+        .delete()
+        .eq('id', studentId);
+      
+      if (error) throw error;
+      
+      toast.success("Student deleted successfully!");
+      fetchStudents();
+    } catch (error) {
+      console.error("Error deleting student:", error);
+      toast.error("Failed to delete student: " + (error.message || "Unknown error"));
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-cyan-50 to-blue-50 p-4 md:p-8">
+      <div className="max-w-6xl mx-auto">
+        <div className="mb-6 flex justify-between items-center">
+          <Button 
+            variant="outline" 
+            onClick={() => navigate('/')} 
+            className="mb-4"
+          >
+            ← Back to Dashboard
+          </Button>
+          <Button 
+            onClick={() => setShowAddStudentDialog(true)}
+            className="bg-blue-600 hover:bg-blue-700"
+          >
+            + Add Student
+          </Button>
+        </div>
+
+        <Card className="bg-white shadow-xl">
+          <CardHeader>
+            <CardTitle className="text-3xl text-slate-700">Student Management</CardTitle>
+            <CardDescription>Manage all students in the system</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="overflow-x-auto">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Name</TableHead>
+                    <TableHead>Registration No.</TableHead>
+                    <TableHead>Roll No.</TableHead>
+                    <TableHead>Class/Year</TableHead>
+                    <TableHead>Course</TableHead>
+                    <TableHead>Phone</TableHead>
+                    <TableHead>Actions</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {students.map((student) => (
+                    <TableRow key={student.id}>
+                      <TableCell className="font-medium">{student.name}</TableCell>
+                      <TableCell>{student.registration_number}</TableCell>
+                      <TableCell>{student.roll_number}</TableCell>
+                      <TableCell>{student.class_year}</TableCell>
+                      <TableCell>{student.course || 'Not specified'}</TableCell>
+                      <TableCell>{student.phone || 'Not provided'}</TableCell>
+                      <TableCell>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          onClick={() => handleDeleteStudent(student.id)}
+                          className="text-red-600 hover:text-red-700"
+                        >
+                          Delete
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Add Student Dialog */}
+        <Dialog open={showAddStudentDialog} onOpenChange={setShowAddStudentDialog}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Add New Student</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4">
+              <div>
+                <Label>Registration Number *</Label>
+                <Input
+                  value={newStudent.registration_number}
+                  onChange={(e) => setNewStudent({...newStudent, registration_number: e.target.value})}
+                  placeholder="REG001"
+                />
+              </div>
+              <div>
+                <Label>Roll Number *</Label>
+                <Input
+                  value={newStudent.roll_number}
+                  onChange={(e) => setNewStudent({...newStudent, roll_number: e.target.value})}
+                  placeholder="ROLL001"
+                />
+              </div>
+              <div>
+                <Label>Name *</Label>
+                <Input
+                  value={newStudent.name}
+                  onChange={(e) => setNewStudent({...newStudent, name: e.target.value})}
+                  placeholder="John Smith"
+                />
+              </div>
+              <div>
+                <Label>Class/Year *</Label>
+                <Input
+                  value={newStudent.class_year}
+                  onChange={(e) => setNewStudent({...newStudent, class_year: e.target.value})}
+                  placeholder="First Year"
+                />
+              </div>
+              <div>
+                <Label>Course</Label>
+                <Input
+                  value={newStudent.course}
+                  onChange={(e) => setNewStudent({...newStudent, course: e.target.value})}
+                  placeholder="Computer Science"
+                />
+              </div>
+              <div>
+                <Label>Phone</Label>
+                <Input
+                  value={newStudent.phone}
+                  onChange={(e) => setNewStudent({...newStudent, phone: e.target.value})}
+                  placeholder="9876543210"
+                />
+              </div>
+              <div className="flex gap-2">
+                <Button onClick={handleAddStudent} className="flex-1">
+                  Add Student
+                </Button>
+                <Button variant="outline" onClick={() => setShowAddStudentDialog(false)}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          </DialogContent>
+        </Dialog>
       </div>
     </div>
   );
@@ -1738,6 +2078,7 @@ function App() {
           <Route path="/issue" element={<IssueUniform />} />
           <Route path="/stock" element={<StockBalance />} />
           <Route path="/history" element={<History />} />
+          <Route path="/students" element={<StudentManagement />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>
       </BrowserRouter>
