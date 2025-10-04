@@ -10,6 +10,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from ".
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "./components/ui/dialog";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "./components/ui/tabs";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui/table";
+import { Badge } from "./components/ui/badge";
 import { toast } from "sonner";
 import { Toaster } from "./components/ui/sonner";
 
@@ -96,11 +97,20 @@ const Dashboard = () => {
     <div className="min-h-screen bg-gradient-to-br from-slate-50 via-cyan-50 to-blue-50 p-4 md:p-8">
       <div className="max-w-6xl mx-auto">
         {/* Header */}
-        <div className="mb-8">
-          <h1 className="text-4xl md:text-5xl font-bold text-slate-800 mb-2" data-testid="app-title">
-            Uniform Tracker
-          </h1>
-          <p className="text-slate-600 text-lg">University Uniform Inventory Management</p>
+        <div className="mb-8 flex justify-between items-start">
+          <div>
+            <h1 className="text-4xl md:text-5xl font-bold text-slate-800 mb-2" data-testid="app-title">
+              Uniform Tracker
+            </h1>
+            <p className="text-slate-600 text-lg">University Uniform Inventory Management</p>
+          </div>
+          <Button 
+            variant="outline" 
+            onClick={() => navigate('/settings')}
+            className="bg-white shadow-lg hover:shadow-xl"
+          >
+            ⚙️ Settings
+          </Button>
         </div>
 
         {/* Stats Cards */}
@@ -288,7 +298,8 @@ const ReceiveStock = () => {
     }
     
     try {
-      const { error } = await supabase
+      // 1. Create the stock receipt
+      const { error: receiptError } = await supabase
         .from('stock_receipts')
         .insert({
           bill_number: formData.bill_number,
@@ -298,12 +309,47 @@ const ReceiveStock = () => {
           items: validItems
         });
       
-      if (error) throw error;
+      if (receiptError) throw receiptError;
+
+      // 2. Update stock balance for each item
+      for (const item of validItems) {
+        // Get current stock
+        const { data: currentStock, error: stockError } = await supabase
+          .from('stock_balance')
+          .select('quantity')
+          .eq('item_id', item.item_id)
+          .eq('size', item.size || null)
+          .single();
+
+        const currentQuantity = currentStock?.quantity || 0;
+        const newQuantity = currentQuantity + item.quantity;
+
+        // Update stock balance
+        const { error: updateError } = await supabase
+          .from('stock_balance')
+          .update({ quantity: newQuantity })
+          .eq('item_id', item.item_id)
+          .eq('size', item.size || null);
+        
+        if (updateError) {
+          // If update fails, try to insert
+          const { error: insertError } = await supabase
+            .from('stock_balance')
+            .insert({
+              item_id: item.item_id,
+              size: item.size || null,
+              quantity: newQuantity
+            });
+          
+          if (insertError) throw insertError;
+        }
+      }
+      
       toast.success("Stock received successfully!");
       navigate('/');
     } catch (error) {
       console.error("Error saving stock receipt:", error);
-      toast.error("Failed to record stock receipt");
+      toast.error("Failed to record stock receipt: " + error.message);
     }
   };
 
@@ -461,22 +507,35 @@ const IssueUniform = () => {
   const [uniformItems, setUniformItems] = useState([]);
   const [selectedItems, setSelectedItems] = useState([]);
   const [issuedBy, setIssuedBy] = useState("");
+  const [billNumber, setBillNumber] = useState("");
   const [showNewStudentDialog, setShowNewStudentDialog] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
   const [showSuggestions, setShowSuggestions] = useState(false);
+  const [studentAlreadyTaken, setStudentAlreadyTaken] = useState([]);
+  const [stockLimits, setStockLimits] = useState({});
+  const [itemLimits, setItemLimits] = useState({});
   const [newStudent, setNewStudent] = useState({
     registration_number: "",
     roll_number: "",
     name: "",
     class_year: "",
+    course: "",
     phone: ""
   });
 
   useEffect(() => {
     if (supabase) {
       fetchUniformItems();
+      fetchItemLimits();
     }
   }, []);
+
+  useEffect(() => {
+    if (student && supabase) {
+      fetchStudentAlreadyTaken();
+      fetchStockLimits();
+    }
+  }, [student]);
 
   const fetchUniformItems = async () => {
     try {
@@ -491,6 +550,119 @@ const IssueUniform = () => {
       console.error("Error fetching uniform items:", error);
       toast.error("Failed to load uniform items");
     }
+  };
+
+  const fetchItemLimits = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('uniform_item_limits')
+        .select('*');
+      
+      if (error) throw error;
+      
+      const limitsMap = {};
+      data?.forEach(limit => {
+        limitsMap[limit.item_id] = limit.max_per_student;
+      });
+      setItemLimits(limitsMap);
+    } catch (error) {
+      console.error("Error fetching item limits:", error);
+    }
+  };
+
+  const fetchStudentAlreadyTaken = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('issue_receipts')
+        .select('*')
+        .eq('student_id', student.id);
+      
+      if (error) throw error;
+      
+      // Flatten the items array from each receipt
+      const flattenedItems = [];
+      data?.forEach(receipt => {
+        if (receipt.items && Array.isArray(receipt.items)) {
+          receipt.items.forEach(item => {
+            flattenedItems.push({
+              ...item,
+              receipt_id: receipt.id,
+              issued_date: receipt.issued_date
+            });
+          });
+        }
+      });
+      
+      setStudentAlreadyTaken(flattenedItems);
+    } catch (error) {
+      console.error("Error fetching student's already taken items:", error);
+    }
+  };
+
+  const fetchStockLimits = async () => {
+    try {
+      // First try to get from stock_balance table
+      const { data: stockData, error: stockError } = await supabase
+        .from('stock_balance')
+        .select('*');
+      
+      if (stockError) {
+        console.warn("stock_balance table not found, using fallback");
+        // Fallback: use uniform_items table if stock_balance doesn't exist
+        const { data: itemsData, error: itemsError } = await supabase
+          .from('uniform_items')
+          .select('*');
+        
+        if (itemsError) throw itemsError;
+        
+        const stockMap = {};
+        itemsData?.forEach(item => {
+          if (item.has_size) {
+            SIZES.forEach(size => {
+              const key = item.id + size;
+              stockMap[key] = 0; // Default to 0 if no stock_balance data
+            });
+          } else {
+            const key = item.id;
+            stockMap[key] = 0; // Default to 0 if no stock_balance data
+          }
+        });
+        setStockLimits(stockMap);
+        return;
+      }
+      
+      const stockMap = {};
+      stockData?.forEach(stock => {
+        const key = stock.item_id + (stock.size || '');
+        stockMap[key] = stock.quantity;
+      });
+      setStockLimits(stockMap);
+    } catch (error) {
+      console.error("Error fetching stock limits:", error);
+    }
+  };
+
+  const checkBillNumberExists = async (billNum) => {
+    try {
+      const { data, error } = await supabase
+        .from('issue_receipts')
+        .select('id')
+        .eq('bill_number', billNum)
+        .single();
+      
+      return data !== null; // If data exists, bill number is taken
+    } catch (error) {
+      return false; // If error (like no rows), bill number is available
+    }
+  };
+
+  const generateBillNumber = () => {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    const random = Math.floor(Math.random() * 1000).toString().padStart(3, '0');
+    return `BILL-${year}${month}${day}-${random}`;
   };
 
   const fetchSuggestions = async (query) => {
@@ -601,6 +773,13 @@ const IssueUniform = () => {
     setSelectedItems(selectedItems.map(item => 
       item.item_id === itemId ? {...item, [field]: value} : item
     ));
+    
+    // Refresh stock after any change to ensure real-time accuracy
+    if (field === 'quantity' || field === 'size') {
+      setTimeout(() => {
+        fetchStockLimits();
+      }, 100);
+    }
   };
 
   const handleIssue = async () => {
@@ -619,8 +798,44 @@ const IssueUniform = () => {
       return;
     }
 
+    if (!billNumber.trim()) {
+      toast.error("Please enter a bill number");
+      return;
+    }
+
+    // Check if bill number already exists
+    const billExists = await checkBillNumberExists(billNumber);
+    if (billExists) {
+      toast.error("Bill number already exists. Please use a different number.");
+      return;
+    }
+
+    // Validate stock and limits before issuing
+    for (const item of selectedItems) {
+      const alreadyTaken = studentAlreadyTaken
+        .filter(taken => taken.item_id === item.item_id)
+        .reduce((total, taken) => total + taken.quantity, 0);
+      
+      const maxLimit = itemLimits[item.item_id] || 1;
+      const key = item.item_id + (item.size || '');
+      const availableStock = stockLimits[key] || 0;
+      
+      if (alreadyTaken + item.quantity > maxLimit) {
+        toast.error(`Cannot issue ${item.quantity} ${item.name}. Student already has ${alreadyTaken}/${maxLimit}`);
+        return;
+      }
+      
+      if (item.quantity > availableStock) {
+        const itemName = uniformItems.find(ui => ui.id === item.item_id)?.name || 'item';
+        toast.error(`Cannot issue ${item.quantity} ${itemName}. Only ${availableStock} available in stock`);
+        return;
+      }
+    }
+
     try {
-      const { error } = await supabase
+      // Start a transaction-like process
+      // 1. Create the issue receipt
+      const { data: receiptData, error: receiptError } = await supabase
         .from('issue_receipts')
         .insert({
           student_id: student.id,
@@ -629,15 +844,56 @@ const IssueUniform = () => {
           roll_number: student.roll_number,
           items: selectedItems,
           issued_date: new Date().toISOString().split('T')[0],
-          issued_by: issuedBy
-        });
+          issued_by: issuedBy,
+          bill_number: billNumber
+        })
+        .select()
+        .single();
       
-      if (error) throw error;
+      if (receiptError) throw receiptError;
+
+      // 2. Update stock for each item
+      for (const item of selectedItems) {
+        const key = item.item_id + (item.size || '');
+        const currentStock = stockLimits[key] || 0;
+        const newStock = currentStock - item.quantity;
+
+        // Update stock balance using the correct approach
+        const { error: stockError } = await supabase
+          .from('stock_balance')
+          .update({ quantity: newStock })
+          .eq('item_id', item.item_id)
+          .eq('size', item.size || null);
+        
+        if (stockError) {
+          // If update fails, try to insert
+          const { error: insertError } = await supabase
+            .from('stock_balance')
+            .insert({
+              item_id: item.item_id,
+              size: item.size || null,
+              quantity: newStock
+            });
+          
+          if (insertError) throw insertError;
+        }
+      }
+      
       toast.success("Uniform issued successfully!");
+      
+      // Clear form
+      setSelectedItems([]);
+      setIssuedBy("");
+      setBillNumber("");
+      
+      // Refresh data
+      fetchStudentAlreadyTaken();
+      fetchStockLimits();
+      
       navigate('/');
     } catch (error) {
       console.error("Error issuing uniform:", error);
-      toast.error("Failed to issue uniform");
+      toast.error("Failed to issue uniform: " + error.message);
     }
   };
 
@@ -706,7 +962,7 @@ const IssueUniform = () => {
             {student && (
               <Card className="bg-blue-50 border-blue-200 mb-6">
                 <CardContent className="pt-6">
-                  <div className="grid md:grid-cols-2 gap-3">
+                  <div className="grid md:grid-cols-3 gap-3">
                     <div>
                       <p className="text-sm text-slate-600">Name</p>
                       <p className="font-semibold text-lg">{student.name}</p>
@@ -723,7 +979,31 @@ const IssueUniform = () => {
                       <p className="text-sm text-slate-600">Class</p>
                       <p className="font-semibold">{student.class_year}</p>
                     </div>
+                    <div>
+                      <p className="text-sm text-slate-600">Course</p>
+                      <p className="font-semibold">{student.course || 'Not specified'}</p>
+                    </div>
+                    <div>
+                      <p className="text-sm text-slate-600">Phone</p>
+                      <p className="font-semibold">{student.phone || 'Not provided'}</p>
+                    </div>
                   </div>
+                  
+                  {/* Already Taken Items */}
+                  {studentAlreadyTaken.length > 0 && (
+                    <div className="mt-4 pt-4 border-t border-blue-200">
+                      <h4 className="font-semibold text-blue-800 mb-2">Already Taken Items:</h4>
+                      <div className="flex flex-wrap gap-2">
+                        {studentAlreadyTaken.map((item, index) => (
+                          <Badge key={index} variant="secondary" className="bg-blue-100 text-blue-800">
+                            {item.name}
+                            {item.size && ` (${item.size})`}
+                            {item.quantity > 1 && ` x${item.quantity}`}
+                          </Badge>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             )}
@@ -737,15 +1017,60 @@ const IssueUniform = () => {
                     const isSelected = selectedItems.some(si => si.item_id === item.id);
                     const selectedItem = selectedItems.find(si => si.item_id === item.id);
                     
+                    // Calculate already taken by this student
+                    const alreadyTaken = studentAlreadyTaken
+                      .filter(taken => taken.item_id === item.id)
+                      .reduce((total, taken) => total + taken.quantity, 0);
+                    
+                    // Get max limit for this item
+                    const maxLimit = itemLimits[item.id] || 1;
+                    
+                    // Calculate available stock for each size
+                    const getAvailableStock = (size) => {
+                      const key = item.id + (size || '');
+                      return stockLimits[key] || 0;
+                    };
+                    
+                    // Check if item can be selected (has stock and within limits)
+                    const canSelect = () => {
+                      if (item.has_size) {
+                        return SIZES.some(size => getAvailableStock(size) > 0);
+                      } else {
+                        return getAvailableStock() > 0;
+                      }
+                    };
+                    
+                    const isWithinLimit = alreadyTaken < maxLimit;
+                    
                     return (
-                      <div key={item.id} className="flex items-center gap-3 p-3 border rounded-lg hover:bg-slate-50">
+                      <div key={item.id} className={`flex items-center gap-3 p-3 border rounded-lg ${
+                        !canSelect() ? 'bg-gray-100 opacity-50' : 'hover:bg-slate-50'
+                      }`}>
                         <input
                           type="checkbox"
                           checked={isSelected}
                           onChange={() => toggleItem(item.id)}
+                          disabled={!canSelect() || !isWithinLimit}
                           className="w-5 h-5"
                         />
-                        <span className="flex-1 font-medium">{item.name}</span>
+                        <div className="flex-1">
+                          <span className="font-medium">{item.name}</span>
+                          <div className="text-sm text-slate-600">
+                            {alreadyTaken > 0 && (
+                              <span className="text-orange-600">
+                                Already taken: {alreadyTaken}/{maxLimit} | 
+                              </span>
+                            )}
+                            {!isWithinLimit && (
+                              <span className="text-red-600"> Limit reached |</span>
+                            )}
+                            {item.has_size ? (
+                              <span> Stock: {SIZES.map(size => `${size}:${getAvailableStock(size)}`).join(', ')}</span>
+                            ) : (
+                              <span> Stock: {getAvailableStock()}</span>
+                            )}
+                          </div>
+                        </div>
                         {isSelected && (
                           <>
                             <Select
@@ -757,14 +1082,27 @@ const IssueUniform = () => {
                                 <SelectValue />
                               </SelectTrigger>
                               <SelectContent>
-                                {SIZES.map(size => (
-                                  <SelectItem key={size} value={size}>{size}</SelectItem>
-                                ))}
+                                {SIZES.map(size => {
+                                  const stock = getAvailableStock(size);
+                                  return (
+                                    <SelectItem 
+                                      key={size} 
+                                      value={size}
+                                      disabled={stock <= 0}
+                                    >
+                                      {size} ({stock} left)
+                                    </SelectItem>
+                                  );
+                                })}
                               </SelectContent>
                             </Select>
                             <Input
                               type="number"
                               min="1"
+                              max={Math.min(
+                                getAvailableStock(selectedItem.size),
+                                maxLimit - alreadyTaken
+                              )}
                               value={selectedItem.quantity}
                               onChange={(e) => updateSelectedItem(item.id, "quantity", parseInt(e.target.value) || 1)}
                               className="w-20"
@@ -774,6 +1112,27 @@ const IssueUniform = () => {
                       </div>
                     );
                   })}
+                </div>
+
+                <div className="mb-6">
+                  <Label htmlFor="bill_number">Bill Number *</Label>
+                  <div className="flex gap-2">
+                    <Input
+                      id="bill_number"
+                      value={billNumber}
+                      onChange={(e) => setBillNumber(e.target.value)}
+                      placeholder="Enter unique bill number"
+                      className="flex-1"
+                    />
+                    <Button 
+                      type="button"
+                      variant="outline" 
+                      onClick={() => setBillNumber(generateBillNumber())}
+                      className="whitespace-nowrap"
+                    >
+                      Generate
+                    </Button>
+                  </div>
                 </div>
 
                 <div className="mb-6">
@@ -832,6 +1191,14 @@ const IssueUniform = () => {
                   value={newStudent.class_year}
                   onChange={(e) => setNewStudent({...newStudent, class_year: e.target.value})}
                   placeholder="e.g., First Year"
+                />
+              </div>
+              <div>
+                <Label>Course</Label>
+                <Input
+                  value={newStudent.course}
+                  onChange={(e) => setNewStudent({...newStudent, course: e.target.value})}
+                  placeholder="e.g., Computer Science"
                 />
               </div>
               <div>
@@ -1144,6 +1511,221 @@ const History = () => {
   );
 };
 
+// Settings Component
+const Settings = () => {
+  const navigate = useNavigate();
+  const [uniformItems, setUniformItems] = useState([]);
+  const [limits, setLimits] = useState({});
+  const [stockLimits, setStockLimits] = useState({});
+  const [studentAlreadyTaken, setStudentAlreadyTaken] = useState([]);
+
+  useEffect(() => {
+    if (supabase) {
+      fetchUniformItems();
+      fetchLimits();
+      fetchStockData();
+      fetchSampleStudentData();
+    }
+  }, []);
+
+  const fetchUniformItems = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('uniform_items')
+        .select('*')
+        .order('name');
+      
+      if (error) throw error;
+      setUniformItems(data || []);
+    } catch (error) {
+      console.error("Error fetching uniform items:", error);
+      toast.error("Failed to load uniform items");
+    }
+  };
+
+  const fetchLimits = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('uniform_item_limits')
+        .select('*');
+      
+      if (error) throw error;
+      
+      const limitsMap = {};
+      data?.forEach(limit => {
+        limitsMap[limit.item_id] = limit.max_per_student;
+      });
+      setLimits(limitsMap);
+    } catch (error) {
+      console.error("Error fetching limits:", error);
+    }
+  };
+
+  const fetchStockData = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('stock_balance')
+        .select('*');
+      
+      if (error) throw error;
+      
+      const stockMap = {};
+      data?.forEach(stock => {
+        const key = stock.item_id + (stock.size || '');
+        stockMap[key] = stock.quantity;
+      });
+      setStockLimits(stockMap);
+    } catch (error) {
+      console.error("Error fetching stock data:", error);
+    }
+  };
+
+  const fetchSampleStudentData = async () => {
+    try {
+      const { data, error } = await supabase
+        .from('issue_receipts')
+        .select('*')
+        .limit(5);
+      
+      if (error) throw error;
+      
+      // Flatten the items array from each receipt
+      const flattenedItems = [];
+      data?.forEach(receipt => {
+        if (receipt.items && Array.isArray(receipt.items)) {
+          receipt.items.forEach(item => {
+            flattenedItems.push({
+              ...item,
+              receipt_id: receipt.id,
+              issued_date: receipt.issued_date
+            });
+          });
+        }
+      });
+      
+      setStudentAlreadyTaken(flattenedItems);
+    } catch (error) {
+      console.error("Error fetching sample student data:", error);
+    }
+  };
+
+  const updateLimit = async (itemId, newLimit) => {
+    try {
+      const { error } = await supabase
+        .from('uniform_item_limits')
+        .upsert({
+          item_id: itemId,
+          max_per_student: newLimit
+        });
+      
+      if (error) throw error;
+      
+      setLimits(prev => ({ ...prev, [itemId]: newLimit }));
+      toast.success("Limit updated successfully!");
+    } catch (error) {
+      console.error("Error updating limit:", error);
+      toast.error("Failed to update limit");
+    }
+  };
+
+  const addTestStock = async () => {
+    try {
+      // Add test stock for all items
+      for (const item of uniformItems) {
+        if (item.has_size) {
+          // Add stock for each size
+          for (const size of ['XS', 'S', 'M', 'L', 'XL', 'XXL']) {
+            const { error } = await supabase
+              .from('stock_balance')
+              .insert({
+                item_id: item.id,
+                size: size,
+                quantity: 10
+              });
+            
+            if (error && !error.message.includes('duplicate')) {
+              console.error(`Error adding stock for ${item.name} ${size}:`, error);
+            }
+          }
+        } else {
+          // Add stock for items without sizes
+          const { error } = await supabase
+            .from('stock_balance')
+            .insert({
+              item_id: item.id,
+              size: null,
+              quantity: 15
+            });
+          
+          if (error && !error.message.includes('duplicate')) {
+            console.error(`Error adding stock for ${item.name}:`, error);
+          }
+        }
+      }
+      toast.success("Test stock added successfully!");
+      fetchStockData(); // Refresh the stock data
+    } catch (error) {
+      console.error("Error adding test stock:", error);
+      toast.error("Failed to add test stock");
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-slate-50 via-cyan-50 to-blue-50 p-4 md:p-8">
+      <div className="max-w-4xl mx-auto">
+        <Button 
+          variant="outline" 
+          onClick={() => navigate('/')} 
+          className="mb-6"
+        >
+          ← Back to Dashboard
+        </Button>
+
+        <Card className="bg-white shadow-xl">
+          <CardHeader>
+            <CardTitle className="text-3xl text-slate-700">Settings</CardTitle>
+            <CardDescription>Manage uniform items and limits</CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="space-y-6">
+              <div>
+                <h3 className="text-xl font-semibold mb-4">Uniform Items & Limits</h3>
+                <p className="text-sm text-slate-600 mb-4">
+                  Set the maximum number of each item a student can receive
+                </p>
+                
+                <div className="space-y-3">
+                  {uniformItems.map(item => (
+                    <div key={item.id} className="flex items-center justify-between p-3 border rounded-lg">
+                      <div className="flex-1">
+                        <p className="font-medium">{item.name}</p>
+                        <p className="text-sm text-slate-500">
+                          {item.has_size ? 'Has sizes' : 'One size only'}
+                        </p>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <Label htmlFor={`limit-${item.id}`}>Max per student:</Label>
+                        <Input
+                          id={`limit-${item.id}`}
+                          type="number"
+                          min="1"
+                          value={limits[item.id] || 1}
+                          onChange={(e) => updateLimit(item.id, parseInt(e.target.value) || 1)}
+                          className="w-20"
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+};
+
 // Main App
 function App() {
   return (
@@ -1156,6 +1738,7 @@ function App() {
           <Route path="/issue" element={<IssueUniform />} />
           <Route path="/stock" element={<StockBalance />} />
           <Route path="/history" element={<History />} />
+          <Route path="/settings" element={<Settings />} />
         </Routes>
       </BrowserRouter>
     </div>
