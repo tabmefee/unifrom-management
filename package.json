@@ -1,0 +1,22 @@
+{
+  "name": "uniform-tracker",
+  "version": "1.0.0",
+  "description": "University Uniform Inventory Management System",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && npm start",
+    "build": "cd frontend && npm run build",
+    "start": "cd frontend && npm start",
+    "install": "cd frontend && npm install --legacy-peer-deps"
+  },
+  "keywords": [
+    "uniform",
+    "inventory",
+    "management",
+    "university",
+    "react",
+    "supabase"
+  ],
+  "author": "Your Name",
+  "license": "MIT"
+}
